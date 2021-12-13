@@ -8,6 +8,7 @@ import uuid
 import time
 import subprocess
 import sys
+from tqdm import tqdm
 
 import cv2
 import numpy as np
@@ -21,9 +22,10 @@ import network
 import guided_filter
 
 class WB_Cartoonize:
-    def __init__(self, weights_dir, gpu):
+    def __init__(self, weights_dir, gpu, batch_size=50):
         if not os.path.exists(weights_dir):
             raise FileNotFoundError("Weights Directory not found, check path")
+        self.batch_size = batch_size
         self.load_model(weights_dir, gpu)
         print("Weights successfully loaded")
     
@@ -49,7 +51,7 @@ class WB_Cartoonize:
         tf.reset_default_graph()
 
         
-        self.input_photo = tf.placeholder(tf.float32, [1, None, None, 3], name='input_image')
+        self.input_photo = tf.placeholder(tf.float32, [None, None, None, 3], name='input_image')
         network_out = network.unet_generator(self.input_photo)
         self.final_out = guided_filter.guided_filter(self.input_photo, network_out, r=1, eps=5e-3)
 
@@ -85,7 +87,34 @@ class WB_Cartoonize:
         
         return output
     
-    def process_video(self, fname, frame_rate):
+    def infer_batch(self, images):
+        batch_images = []
+        for pic in images:
+            image = self.resize_crop(pic)
+            batch_image = image.astype(np.float32)/127.5 - 1
+            batch_images.append(batch_image)
+            # batch_image = np.expand_dims(batch_image, axis=0)
+        
+        batch_images = np.array(batch_images)
+        
+        ## Session Run
+        output = self.sess.run(self.final_out, feed_dict={self.input_photo: batch_images})
+        
+        ## Post Process
+        output = (output+1)*127.5
+        output = np.clip(output, 0, 255).astype(np.uint8)
+        
+        return output
+    
+    def write_frames(self, out, frames, target_size):
+        length = frames.shape[0]
+
+        for i in range(length):
+            frame = cv2.resize(frames[i], target_size)
+            out.writeFrame(frame)
+
+    def process_video(self, fname, frame_rate, batch_size=10):
+        self.batch_size = batch_size
         ## Capture video using opencv
         cap = cv2.VideoCapture(fname)
 
@@ -94,27 +123,48 @@ class WB_Cartoonize:
 
         out = skvideo.io.FFmpegWriter(output_fname, inputdict={'-r':frame_rate}, outputdict={'-r':frame_rate})
 
+        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        pbar = tqdm(total = total_frames+1)
+
+        frames = []
+
         while True:
             ret, frame = cap.read()
             
             if ret:
                 
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                frames.append(frame)
+
+                if len(frames) == self.batch_size:
+                    infer_frames = self.infer_batch(frames)
+                    self.write_frames(out, infer_frames, target_size)
+                    frames = []
+
                 
-                frame = self.infer(frame)
+                # frame = self.infer(frame)
                 
-                frame = cv2.resize(frame, target_size)
+                # frame = cv2.resize(frame, target_size)
                 
-                out.writeFrame(frame)
+                # out.writeFrame(frame)
+
+                pbar.update(1)
                 
             else:
                 break
+        
+        if frames:
+            infer_frames = self.infer_batch(frames)
+            self.write_frames(out, infer_frames, target_size)
+            frames = []
+
         cap.release()
         out.close()
-        
+
         final_name = '{}final_{}'.format(fname.replace(os.path.basename(fname), ''), os.path.basename(output_fname))
 
-        p = subprocess.Popen(['ffmpeg','-i','{}'.format(output_fname), "-pix_fmt", "yuv420p", final_name])
+        p = subprocess.Popen(['ffmpeg', '-i','{}'.format(output_fname), "-pix_fmt", "yuv420p", final_name])
         p.communicate()
         p.wait()
 
